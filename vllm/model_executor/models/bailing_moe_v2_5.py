@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import math
 from torch import nn
 from itertools import islice
 
@@ -29,6 +30,7 @@ from .utils import (
     maybe_prefix,
 )
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -49,6 +51,7 @@ class BailingMoeV2_5LinearAttention(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        layer_idx = int(prefix.split(".")[-1])
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
@@ -95,17 +98,52 @@ class BailingMoeV2_5LinearAttention(nn.Module):
             is_neox_style=True,
         )
 
+        self.g_norm = RMSNorm(self.num_heads, eps=config.rms_norm_eps)
+        self.g_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.total_num_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.g_proj",
+        )
+
+        slope = -BailingMoeV2_5LinearAttention.build_slope_tensor(self.num_heads) * (
+            1 - (layer_idx - 1) / (config.num_hidden_layers - 1) + 1e-5
+        )
+        self.register_buffer("slope", slope, persistent=False)
+
         self.lightning_attn_ops = {
             "chunk": chunk_simple_gla,
             "fused_recurrent": fused_recurrent_simple_gla,
         }
+
+    @staticmethod
+    def build_slope_tensor(n_attention_heads: int):
+        def get_slopes(n):
+            def get_slopes_power_of_2(n):
+                start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+                ratio = start
+                return [start * ratio**i for i in range(n)]
+
+            if math.log2(n).is_integer():
+                return get_slopes_power_of_2(n)
+            else:
+                closest_power_of_2 = 2 ** math.floor(math.log2(n))
+                return (
+                    get_slopes_power_of_2(closest_power_of_2)
+                    + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+                )
+
+        slopes = torch.tensor(get_slopes(n_attention_heads), dtype=torch.float)
+        return slopes
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        mode = "fused_recurrent" if hidden_states.size(1) == 1 else "chunk"
+        bsz, seq_len, _ = hidden_states.size()
+        mode = "fused_recurrent" if seq_len == 1 else "chunk"
 
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split(
@@ -121,6 +159,21 @@ class BailingMoeV2_5LinearAttention(nn.Module):
             k = k.view(-1, self.kv_size_per_rank)
 
         q, k = self.rotary_emb(position_ids, q, k)
+        o, _ = self.lightning_attn_ops[mode](
+            q=q,
+            k=k,
+            v=v,
+            g=self.slope[None, None, :].expand(bsz, seq_len, self.num_heads),
+            initial_state=None,
+            output_final_state=False,
+        )
+        o = o.reshape(bsz, seq_len, -1)
+        o = self.g_norm(o)
+        g_proj = self.g_proj(hidden_states)
+        o = o * torch.sigmoid_(g_proj)
+        o = self.dense(o)
+
+        return o
 
 
 class BailingMoeV2_5Block(nn.Module):
