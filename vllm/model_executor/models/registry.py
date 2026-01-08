@@ -78,6 +78,7 @@ _TEXT_GENERATION_MODELS = {
     "BaichuanForCausalLM": ("baichuan", "BaichuanForCausalLM"),
     "BailingMoeForCausalLM": ("bailing_moe", "BailingMoeForCausalLM"),
     "BailingMoeV2ForCausalLM": ("bailing_moe", "BailingMoeV2ForCausalLM"),
+    "BailingMoeV2_5ForCausalLM": ("bailing_moe_v2_5", "BailingMoeV2_5ForCausalLM"),
     "BambaForCausalLM": ("bamba", "BambaForCausalLM"),
     "BloomForCausalLM": ("bloom", "BloomForCausalLM"),
     "ChatGLMModel": ("chatglm", "ChatGLMForCausalLM"),
