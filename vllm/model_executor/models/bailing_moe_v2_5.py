@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 import torch
 import torch.nn.functional as F
 import math
@@ -8,6 +9,7 @@ from transformers.configuration_utils import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.sequence import IntermediateTensors
+from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -18,6 +20,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from .interfaces import SupportsPP
@@ -41,6 +44,38 @@ from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 from fla.ops.simple_gla.chunk import chunk_simple_gla
 
 
+def is_mla_layer(layer_idx: int, config: PretrainedConfig) -> bool:
+    return (
+        (layer_idx + 1) % config.layer_group_size == 0
+        or layer_idx
+        >= config.num_hidden_layers // config.layer_group_size * config.layer_group_size
+    )
+
+
+class BailingMoeV2_5GroupRMSNorm(nn.Module):
+    def __init__(self, hidden_size, group_norm_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.group_norm_size = group_norm_size
+        assert (
+            hidden_size % group_norm_size == 0
+        ), "hidden_size must be divisible by group_norm_size"
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        input_shape = hidden_states.size()
+        group_input_shape = input_shape[:-1] + (
+            self.group_norm_size,
+            input_shape[-1] // self.group_norm_size,
+        )
+        hidden_states = hidden_states.view(group_input_shape)
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.view(input_shape).to(input_dtype)
+
+
 class BailingMoeV2_5LinearAttention(nn.Module):
     def __init__(
         self,
@@ -51,7 +86,7 @@ class BailingMoeV2_5LinearAttention(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        layer_idx = int(prefix.split(".")[-1])
+        layer_idx = int(prefix.split(".")[-2])
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
@@ -94,11 +129,20 @@ class BailingMoeV2_5LinearAttention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=config.max_position_embeddings,
-            rope_parameters=config.rope_parameters,
+            # rotary embedding parameters from config, if vllm version is earlier, pass rotary_dim and base instead
+            # rotary_dim=config.rotary_dim,
+            # base=config.rope_theta,
+            rope_parameters=(
+                config.rope_parameters if hasattr(config, "rope_parameters") else None
+            ),
             is_neox_style=True,
         )
 
-        self.g_norm = RMSNorm(self.num_heads, eps=config.rms_norm_eps)
+        self.g_norm = BailingMoeV2_5GroupRMSNorm(
+            self.num_heads * self.head_dim,
+            config.group_norm_size,
+            eps=config.rms_norm_eps,
+        )
         self.g_proj = ColumnParallelLinear(
             self.hidden_size,
             self.total_num_heads * self.head_dim,
@@ -142,7 +186,9 @@ class BailingMoeV2_5LinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        bsz, seq_len, _ = hidden_states.size()
+        # hidden_states: (tokens, hidden_size)
+        # hidden_states: (4096, 2048)
+        bsz, seq_len = hidden_states.size()
         mode = "fused_recurrent" if seq_len == 1 else "chunk"
 
         qkv, _ = self.query_key_value(hidden_states)
@@ -159,6 +205,7 @@ class BailingMoeV2_5LinearAttention(nn.Module):
             k = k.view(-1, self.kv_size_per_rank)
 
         q, k = self.rotary_emb(position_ids, q, k)
+        # q.shape=k.shape=v.shape=(4096, 2048)
         o, _ = self.lightning_attn_ops[mode](
             q=q,
             k=k,
@@ -179,6 +226,7 @@ class BailingMoeV2_5LinearAttention(nn.Module):
 class BailingMoeV2_5Block(nn.Module):
     def __init__(
         self,
+        vllm_config: VllmConfig,
         config: PretrainedConfig,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -186,23 +234,37 @@ class BailingMoeV2_5Block(nn.Module):
     ):
         super().__init__()
         layer_idx = int(prefix.split(".")[-1])
+        self.layer_idx = layer_idx
         self.config = config
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
-        if (
-            (layer_idx + 1) % config.layer_group_size == 0
-            or layer_idx >= config.num_hidden_layers // config.layer_group_size**2
-        ):
+        if self._is_mla_layer():
             attn_cls = DeepseekV2MLAAttention
+            attn_args = {
+                "vllm_config": vllm_config,
+                "config": config,
+                "hidden_size": hidden_size,
+                "num_heads": config.num_attention_heads,
+                "qk_nope_head_dim": config.qk_nope_head_dim,
+                "qk_rope_head_dim": config.qk_rope_head_dim,
+                "v_head_dim": config.v_head_dim,
+                "q_lora_rank": config.q_lora_rank,
+                "kv_lora_rank": config.kv_lora_rank,
+                "prefix": f"{prefix}.attention",
+            }
         else:
             attn_cls = BailingMoeV2_5LinearAttention
+            attn_args = {
+                "config": config,
+                "cache_config": cache_config,
+                "quant_config": quant_config,
+                "prefix": f"{prefix}.attention",
+            }
 
-        self.attention = attn_cls(
-            config, cache_config, quant_config, prefix=f"{prefix}.attention"
-        )
+        self.attention = attn_cls(**attn_args)
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
@@ -214,6 +276,9 @@ class BailingMoeV2_5Block(nn.Module):
         self.mlp = mlp_class(
             intermediate_size, config, quant_config, True, prefix=f"{prefix}.mlp"
         )
+
+    def _is_mla_layer(self) -> bool:
+        return is_mla_layer(self.layer_idx, self.config)
 
     def forward(
         self,
@@ -235,6 +300,13 @@ class BailingMoeV2_5Block(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded_params: set[str] = set()
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        for name, loaded_weight in weights:
+            print(f"Loading weight: {name} into {self.layer_idx} {loaded_weight.shape}")
+        return loaded_params
 
 
 @support_torch_compile
@@ -270,6 +342,7 @@ class BailingMoeV2_5Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: BailingMoeV2_5Block(
+                vllm_config=vllm_config,
                 config=config,
                 cache_config=cache_config,
                 quant_config=quant_config,
@@ -326,6 +399,98 @@ class BailingMoeV2_5Model(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return SharedFusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+        expert_params_mapping = self.get_expert_mapping()
+        # name: ckpt weight name
+        # loaded_weight: ckpt weight tensor
+        # param_dict: model parameter dict
+        for name, loaded_weight in weights:
+            if (
+                hasattr(self.config, "norm_head")
+                and self.config.norm_head
+                and "lm_head.weight" in name
+            ):
+                loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "mlp.experts" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    break
+                else:
+                    # replace mla dense param with o_proj
+                    if "dense" in name:
+                        layer_idx = int(name.split("layers.")[1].split(".")[0])
+                        if is_mla_layer(layer_idx, self.config):
+                            name = name.replace("dense", "o_proj")
+
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if name not in params_dict:
+                        continue
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
 
 class BailingMoeV2_5ForCausalLM(nn.Module, SupportsPP):
     def __init__(
@@ -380,3 +545,17 @@ class BailingMoeV2_5ForCausalLM(nn.Module, SupportsPP):
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
         return model_output
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."] if self.tie_word_embeddings else None),
+        )
+        return loader.load_weights(weights)
