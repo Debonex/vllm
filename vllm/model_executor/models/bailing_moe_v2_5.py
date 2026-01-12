@@ -5,6 +5,8 @@ import math
 from torch import nn
 from itertools import islice
 
+from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.forward_context import get_forward_context
 from transformers.configuration_utils import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -64,7 +66,9 @@ class BailingMoeV2_5GroupRMSNorm(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
+        # [t, hidden_size]
         input_shape = hidden_states.size()
+        # [t, group_norm_size, hidden_size // group_norm_size]
         group_input_shape = input_shape[:-1] + (
             self.group_norm_size,
             input_shape[-1] // self.group_norm_size,
@@ -186,10 +190,24 @@ class BailingMoeV2_5LinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
+        attn_metadata: AttentionMetadata = get_forward_context().attn_metadata
+
+        if attn_metadata is None:
+            # V1 profile run
+            return
+
+        # NOTE: just for functional test when we run vllm-ascend without right backend
+        attn_metadata = attn_metadata["model.layers.4.attention.attn"]
+
+        # NOTE: just for functional test when we run vllm-ascend without right backend
+        query_start_loc = attn_metadata.query_start_loc
         # hidden_states: (tokens, hidden_size)
         # hidden_states: (4096, 2048)
-        bsz, seq_len = hidden_states.size()
-        mode = "fused_recurrent" if seq_len == 1 else "chunk"
+        num_tokens, hidden_size = hidden_states.size()
+
+        # mode = "fused_recurrent" if num_tokens == 1 else "chunk"
+        # NOTE: now we have accuracy issue with chunk_simple_gla, so we always use fused_recurrent
+        mode = "fused_recurrent"
 
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split(
@@ -206,19 +224,28 @@ class BailingMoeV2_5LinearAttention(nn.Module):
 
         q, k = self.rotary_emb(position_ids, q, k)
         # q.shape=k.shape=v.shape=(4096, 2048)
+
+        # 'b t h d -> 1 (b t) h d')
+        q = q.view(1, num_tokens, self.num_heads, self.head_dim)
+        k = k.view(1, num_tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(1, num_tokens, self.num_kv_heads, self.head_dim)
         o, _ = self.lightning_attn_ops[mode](
             q=q,
             k=k,
             v=v,
-            g=self.slope[None, None, :].expand(bsz, seq_len, self.num_heads),
+            g=self.slope[None, None, :].expand(
+                1, num_tokens, hidden_size, self.num_heads
+            ),
             initial_state=None,
             output_final_state=False,
+            # NOTE: just for functional test when we run vllm-ascend without right backend
+            cu_seqlens=query_start_loc[: attn_metadata.num_actual_tokens + 1],
         )
-        o = o.reshape(bsz, seq_len, -1)
+        o = o.reshape(num_tokens, hidden_size)
         o = self.g_norm(o)
-        g_proj = self.g_proj(hidden_states)
+        g_proj, _ = self.g_proj(hidden_states)
         o = o * torch.sigmoid_(g_proj)
-        o = self.dense(o)
+        o, _ = self.dense(o)
 
         return o
 
@@ -292,12 +319,23 @@ class BailingMoeV2_5Block(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.attention(
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-        )
+        attn_kwargs = {
+            "hidden_states": hidden_states,
+        }
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self._is_mla_layer():
+            attn_kwargs["positions"] = position_ids
+        else:
+            attn_kwargs["position_ids"] = position_ids
+
+        attn_output = self.attention(**attn_kwargs)
+
+        if attn_output is None:
+            # NOTE: when we run profiling with vllm v1, attn_metadata is None, so we skip attention
+            attn_output = torch.empty_like(hidden_states)
+
+
+        hidden_states, residual = self.post_attention_layernorm(attn_output, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
