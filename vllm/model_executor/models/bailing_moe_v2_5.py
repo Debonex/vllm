@@ -14,6 +14,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -57,7 +58,12 @@ def is_mla_layer(layer_idx: int, config: PretrainedConfig) -> bool:
 class BailingMoeV2_5GroupRMSNorm(nn.Module):
     def __init__(self, hidden_size, group_norm_size, eps=1e-6):
         super().__init__()
+        # TODO: use vllm way to register parameter
         self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight.weight_loader = self.weight_loader
+
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.group_norm_size = group_norm_size
         assert (
             hidden_size % group_norm_size == 0
@@ -78,6 +84,15 @@ class BailingMoeV2_5GroupRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.view(input_shape).to(input_dtype)
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        param_data = param.data
+        loaded_weight = loaded_weight.view(self.tp_size, -1)[self.tp_rank].contiguous()
+        param_data.copy_(loaded_weight)
 
 
 class BailingMoeV2_5LinearAttention(nn.Module):
@@ -101,6 +116,7 @@ class BailingMoeV2_5LinearAttention(nn.Module):
 
         self.num_heads = self.total_num_heads // tp_size
         self.head_dim = config.head_dim or (self.hidden_size // self.total_num_heads)
+        # we have same q_size_per_rank and kv_size_per_rank in bailing moe v2.5
         self.q_size_per_rank = self.head_dim * self.num_heads
         self.num_kv_heads = max(1, self.total_kv_heads // tp_size)
         self.kv_size_per_rank = self.num_kv_heads * self.head_dim
@@ -241,7 +257,7 @@ class BailingMoeV2_5LinearAttention(nn.Module):
             # NOTE: just for functional test when we run vllm-ascend without right backend
             cu_seqlens=query_start_loc[: attn_metadata.num_actual_tokens + 1],
         )
-        o = o.reshape(num_tokens, hidden_size)
+        o = o.reshape(num_tokens, self.q_size_per_rank)
         o = self.g_norm(o)
         g_proj, _ = self.g_proj(hidden_states)
         o = o * torch.sigmoid_(g_proj)
@@ -333,7 +349,6 @@ class BailingMoeV2_5Block(nn.Module):
         if attn_output is None:
             # NOTE: when we run profiling with vllm v1, attn_metadata is None, so we skip attention
             attn_output = torch.empty_like(hidden_states)
-
 
         hidden_states, residual = self.post_attention_layernorm(attn_output, residual)
         hidden_states = self.mlp(hidden_states)
