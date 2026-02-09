@@ -93,6 +93,15 @@ class MambaStateDtypeCalculator:
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         return (state_dtype, state_dtype, state_dtype, torch.float32)
 
+    @classmethod
+    def gla_state_dtype(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+        mamba_cache_dtype: MambaDType,
+    ) -> tuple[torch.dtype, ...]:
+        state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+        return (state_dtype,)
+
 
 class MambaStateShapeCalculator:
     @classmethod
