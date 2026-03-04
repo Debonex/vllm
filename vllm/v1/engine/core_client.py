@@ -47,6 +47,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
+    get_engine_zmq_addresses,
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
@@ -491,9 +492,43 @@ class MPClient(EngineCoreClient):
                 input_address = client_addresses["input_address"]
                 output_address = client_addresses["output_address"]
                 self.stats_update_address = client_addresses.get("stats_update_address")
+                self.input_socket = self.resources.input_socket = make_zmq_socket(
+                    self.ctx, input_address, zmq.ROUTER, bind=True
+                )
+                self.resources.output_socket = make_zmq_socket(
+                    self.ctx, output_address, zmq.PULL
+                )
             else:
                 # Engines are managed by this client.
-                with launch_core_engines(vllm_config, executor_class, log_stats) as (
+                addresses = get_engine_zmq_addresses(vllm_config)
+                # Use late binding (return_address=True) to avoid port
+                # conflicts. Wildcard addresses (port 0) get an OS-assigned
+                # port at bind time, and we capture the actual address to
+                # pass to engines in the handshake (issue #28498).
+                self.input_socket, actual_input = make_zmq_socket(
+                    self.ctx,
+                    addresses.inputs[0],
+                    zmq.ROUTER,
+                    bind=True,
+                    return_address=True,
+                )
+                self.resources.input_socket = self.input_socket
+                addresses.inputs[0] = actual_input
+
+                self.resources.output_socket, actual_output = make_zmq_socket(
+                    self.ctx,
+                    addresses.outputs[0],
+                    zmq.PULL,
+                    return_address=True,
+                )
+                addresses.outputs[0] = actual_output
+
+                with launch_core_engines(
+                    vllm_config,
+                    executor_class,
+                    log_stats,
+                    addresses=addresses,
+                ) as (
                     engine_manager,
                     coordinator,
                     addresses,
@@ -501,21 +536,11 @@ class MPClient(EngineCoreClient):
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
 
-                (input_address,) = addresses.inputs
-                (output_address,) = addresses.outputs
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if coordinator is not None:
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
                     )
-
-            # Create input and output sockets.
-            self.input_socket = self.resources.input_socket = make_zmq_socket(
-                self.ctx, input_address, zmq.ROUTER, bind=True
-            )
-            self.resources.output_socket = make_zmq_socket(
-                self.ctx, output_address, zmq.PULL
-            )
 
             parallel_config = vllm_config.parallel_config
             dp_size = parallel_config.data_parallel_size

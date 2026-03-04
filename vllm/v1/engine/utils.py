@@ -773,11 +773,66 @@ class CoreEngineActorManager:
             ray.util.remove_placement_group(pg)
 
 
+def get_engine_zmq_addresses(
+    vllm_config: VllmConfig,
+    num_api_servers: int = 1,
+) -> EngineZmqAddresses:
+    """Allocate ZMQ addresses for engine-client communication.
+
+    When num_api_servers == 1, uses late binding (wildcard port 0) so that
+    the actual port is assigned at socket bind time, avoiding port conflicts
+    (issue #28498). When num_api_servers > 1, pre-allocates ports because
+    the binding and port discovery happen in different processes.
+    """
+    parallel_config = vllm_config.parallel_config
+    local_engine_count = parallel_config.data_parallel_size_local
+    local_start_index = parallel_config.data_parallel_rank_local
+    dp_size = parallel_config.data_parallel_size
+    host = parallel_config.data_parallel_master_ip
+    local_engines_only = parallel_config.local_engines_only
+
+    # In offline mode there is an LLM instance per DP rank and
+    # one core engine per LLM, see
+    # examples/offline_inference/data_parallel.py.
+    offline_mode = local_start_index is not None
+
+    # client_local_only = True for cases where this front-end
+    # sends requests only to colocated engines.
+    client_local_only = (
+        offline_mode or local_engines_only or (local_engine_count == dp_size)
+    )
+    # NOTE(yongji): handling scaling from intra-node to inter-node
+    if parallel_config.enable_elastic_ep:
+        client_local_only = False
+
+    # Use late binding (wildcard port) when the binding and address
+    # discovery happen in the same process (single API server).
+    # For multi-server, ports must be pre-allocated since workers
+    # bind in separate processes from where addresses are distributed.
+    use_late_binding = num_api_servers == 1
+
+    return EngineZmqAddresses(
+        inputs=[
+            get_engine_client_zmq_addr(
+                client_local_only, host, late_binding=use_late_binding
+            )
+            for _ in range(num_api_servers)
+        ],
+        outputs=[
+            get_engine_client_zmq_addr(
+                client_local_only, host, late_binding=use_late_binding
+            )
+            for _ in range(num_api_servers)
+        ],
+    )
+
+
 @contextlib.contextmanager
 def launch_core_engines(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
     log_stats: bool,
+    addresses: EngineZmqAddresses | None = None,
     num_api_servers: int = 1,
 ) -> Iterator[
     tuple[
@@ -801,23 +856,8 @@ def launch_core_engines(
     # examples/offline_inference/data_parallel.py.
     offline_mode = local_start_index is not None
 
-    # client_local_only = True for cases where this front-end
-    # sends requests only to colocated engines.
-    client_local_only = (
-        offline_mode or local_engines_only or (local_engine_count == dp_size)
-    )
-
-    # Set up input and output addresses.
-    addresses = EngineZmqAddresses(
-        inputs=[
-            get_engine_client_zmq_addr(client_local_only, host)
-            for _ in range(num_api_servers)
-        ],
-        outputs=[
-            get_engine_client_zmq_addr(client_local_only, host)
-            for _ in range(num_api_servers)
-        ],
-    )
+    if addresses is None:
+        addresses = get_engine_zmq_addresses(vllm_config, num_api_servers)
 
     # Run the DP Coordinator process with rank 0 when in online DP mode.
     # The coordinator is needed for:
