@@ -41,11 +41,12 @@ class BailingMoeV2_5Config(PretrainedConfig):
         qk_rope_head_dim=64,
         routed_scaling_factor=2.5,
         score_function="sigmoid",
+        tie_word_embeddings=False,
         layer_types=None,
         **kwargs,
     ):
         super().__init__(
-            # tie_word_embeddings=tie_word_embeddings,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
         self.attention_dropout = attention_dropout
@@ -77,12 +78,14 @@ class BailingMoeV2_5Config(PretrainedConfig):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.routed_scaling_factor = routed_scaling_factor
         self.score_function = score_function
+        self.tie_word_embeddings = tie_word_embeddings
 
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                # TODO: use configurable layer types instead of hardcoding here.
-                "linear_attention" if bool((i + 1) % 5) else "full_attention"
+                "linear_attention"
+                if bool((i + 1) % self.layer_group_size)
+                else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
 
