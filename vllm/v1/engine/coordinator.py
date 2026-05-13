@@ -76,11 +76,22 @@ class DPCoordinator:
         back_publish_address = get_engine_client_zmq_addr(local_only_eng, host)
         back_output_address = get_engine_client_zmq_addr(local_only_eng, host)
 
-        # Create pipe for late binding address reporting from coordinator
-        # process. When wildcard addresses (port 0) are used, the
-        # coordinator binds and discovers actual ports, then reports them
-        # back via this pipe (issue #28498).
-        parent_conn, child_conn = multiprocessing.Pipe()
+        # When wildcard addresses (port 0) are used, the coordinator binds
+        # and discovers actual ports, then reports them back via a pipe
+        # (issue #28498). Only create the pipe when late binding is needed,
+        # otherwise the child process would still try to send on a pipe
+        # whose parent end is already closed, causing BrokenPipeError.
+        needs_late_binding = any(
+            is_wildcard_addr(x)
+            for x in (front_publish_address, back_publish_address, back_output_address)
+        )
+
+        if needs_late_binding:
+            parent_conn, child_conn = multiprocessing.Pipe()
+            address_report_pipe = child_conn
+        else:
+            parent_conn = None
+            address_report_pipe = None
 
         context = get_mp_context()
         self.proc: multiprocessing.Process = context.Process(
@@ -91,19 +102,12 @@ class DPCoordinator:
                 "front_publish_address": front_publish_address,
                 "back_output_address": back_output_address,
                 "back_publish_address": back_publish_address,
-                "address_report_pipe": child_conn,
+                "address_report_pipe": address_report_pipe,
                 "enable_wave_coordination": enable_wave_coordination,
             },
             daemon=True,
         )
         self.proc.start()
-
-        # Wait for coordinator to report actual bound addresses when using
-        # late binding (wildcard port addresses).
-        needs_late_binding = any(
-            is_wildcard_addr(x)
-            for x in (front_publish_address, back_publish_address, back_output_address)
-        )
 
         if needs_late_binding:
             if not parent_conn.poll(timeout=30.0):
@@ -123,7 +127,7 @@ class DPCoordinator:
                 back_publish_address,
                 back_output_address,
             )
-        parent_conn.close()
+            parent_conn.close()
 
         self.stats_publish_address = front_publish_address
         self.coord_in_address = back_publish_address
