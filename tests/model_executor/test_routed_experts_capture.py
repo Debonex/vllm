@@ -4,6 +4,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,8 +12,17 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RoutedExpertsManager,
+    resolve_routed_experts_slot_mapping_spec,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 pytestmark = pytest.mark.cpu_test
 
@@ -278,3 +288,306 @@ def test_routed_experts_capturer_dp_unexpected_batch_raises():
     ):
         capturer.capture(layer_id=0, topk_ids=topk)
     assert capturer.device_buffer[0, 0, 0].item() == -1
+
+
+# ---------------------------------------------------------------------------
+# Canonical routing-slot tests (resolve_routed_experts_slot_mapping_spec,
+# RoutedExpertsManager logical-block geometry, and the worker-side
+# _build_routed_experts_routing_slots helper).
+# ---------------------------------------------------------------------------
+
+import torch.nn.functional  # noqa: F401,E402  (side-effect import, kept close to use)
+
+_TORCH_DTYPE = torch.float16
+
+
+def _full_attn_group(block_size: int, layer: str = "layers.0") -> KVCacheGroupSpec:
+    return KVCacheGroupSpec(
+        layer_names=[layer],
+        kv_cache_spec=FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=_TORCH_DTYPE,
+        ),
+    )
+
+
+def _swa_group(block_size: int, window: int = 128) -> KVCacheGroupSpec:
+    return KVCacheGroupSpec(
+        layer_names=["layers.1"],
+        kv_cache_spec=SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=_TORCH_DTYPE,
+            sliding_window=window,
+        ),
+    )
+
+
+def _kv_config(groups: list[KVCacheGroupSpec], num_blocks: int = 16) -> KVCacheConfig:
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+
+def test_resolver_full_attention_defaults_to_block_size():
+    spec = resolve_routed_experts_slot_mapping_spec(_kv_config([_full_attn_group(16)]))
+    assert spec.logical_block_size == 16
+    assert spec.kv_cache_group_id == 0
+
+
+def test_resolver_picks_smallest_logical_block_size_then_smallest_gid():
+    groups = [
+        _full_attn_group(32, "a"),
+        _full_attn_group(8, "b"),
+        _full_attn_group(8, "c"),
+    ]
+    spec = resolve_routed_experts_slot_mapping_spec(_kv_config(groups))
+    # tie between gid 1 and 2 at size 8 -> smallest gid wins.
+    assert spec.logical_block_size == 8
+    assert spec.kv_cache_group_id == 1
+
+
+def test_resolver_swa_not_a_candidate_but_full_attention_is():
+    # Sliding window specs recycle historical blocks and must not anchor;
+    # the full-attention group is still eligible.
+    groups = [_swa_group(16), _full_attn_group(32, "layers.9")]
+    spec = resolve_routed_experts_slot_mapping_spec(_kv_config(groups))
+    assert spec.kv_cache_group_id == 1
+    assert spec.logical_block_size == 32
+
+
+def test_resolver_no_candidate_raises():
+    with pytest.raises(ValueError, match="no KV cache group"):
+        resolve_routed_experts_slot_mapping_spec(_kv_config([_swa_group(16)]))
+
+
+def test_resolver_rejects_non_positive_logical_size():
+    class _BrokenSpec(FullAttentionSpec):
+        @property
+        def routed_experts_logical_block_size(self) -> int | None:
+            return 0
+
+    group = KVCacheGroupSpec(
+        layer_names=["layers.0"],
+        kv_cache_spec=_BrokenSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=_TORCH_DTYPE
+        ),
+    )
+    with pytest.raises(ValueError, match="invalid routed_experts_logical_block_size"):
+        resolve_routed_experts_slot_mapping_spec(_kv_config([group]))
+
+
+class _StubHfConfig:
+    num_experts = 8
+    n_routed_experts = 8
+    num_experts_per_tok = 2
+    num_hidden_layers = 3
+
+
+def _make_manager(logical_block_size: int, num_blocks: int = 4) -> RoutedExpertsManager:
+    mgr = RoutedExpertsManager.__new__(RoutedExpertsManager)
+    mgr.kv_cache_group_id = 0
+    mgr.logical_block_size = logical_block_size
+    hf = _StubHfConfig()
+    mgr.routed_experts_by_slot = np.zeros(
+        (num_blocks * logical_block_size, hf.num_hidden_layers, hf.num_experts_per_tok),
+        dtype=np.uint8,
+    )
+    return mgr
+
+
+def test_manager_get_across_logical_blocks_with_token_start():
+    # logical_block_size=8 > physical block_size=4: consecutive original
+    # tokens in the same logical block share one block table entry and must
+    # not overwrite each other.
+    mgr = _make_manager(logical_block_size=8, num_blocks=4)
+    # Two logical blocks: block ids 1 and 2.
+    block_ids = [1, 2]
+    # Fill slots for 12 tokens: positions 0..7 in block 1, 8..11 in block 2.
+    for pos in range(12):
+        slot = (block_ids[pos // 8] * 8) + pos % 8
+        mgr.routed_experts_by_slot[slot] = pos  # layer/top_k broadcast
+    out = mgr.get(block_ids, num_tokens=12)
+    assert out.shape == (12, 3, 2)
+    for pos in range(12):
+        assert out[pos, 0, 0] == pos, f"position {pos} corrupted"
+    # token_start skips the first 5 tokens.
+    out2 = mgr.get(block_ids, num_tokens=12, token_start=5)
+    assert out2.shape == (7, 3, 2)
+    assert out2[0, 0, 0] == 5
+    assert out2[6, 0, 0] == 11
+
+
+def test_manager_buffer_capacity_scales_with_logical_block_size():
+    mgr = _make_manager(logical_block_size=8, num_blocks=4)
+    assert mgr.routed_experts_by_slot.shape[0] == 4 * 8
+
+
+def test_manager_get_insufficient_block_ids_fails():
+    mgr = _make_manager(logical_block_size=8, num_blocks=4)
+    # 20 tokens need 3 logical blocks; only 2 block ids available.
+    with pytest.raises(ValueError, match="logical blocks"):
+        mgr.get([1, 2], num_tokens=20)
+
+
+def test_manager_store_batch_row_mismatch_fails():
+    mgr = _make_manager(logical_block_size=8)
+    data = np.zeros((3, 3, 2), dtype=np.uint8)
+    slots = np.array([0, 1])
+    with pytest.raises(ValueError, match="do not match"):
+        mgr.store_batch(data, slots)
+
+
+def test_manager_store_batch_negative_slot_fails():
+    mgr = _make_manager(logical_block_size=8)
+    data = np.zeros((2, 3, 2), dtype=np.uint8)
+    slots = np.array([0, -1])
+    with pytest.raises(ValueError, match="out of range"):
+        mgr.store_batch(data, slots)
+
+
+def test_manager_store_batch_slot_beyond_buffer_fails():
+    mgr = _make_manager(logical_block_size=8, num_blocks=4)
+    data = np.zeros((2, 3, 2), dtype=np.uint8)
+    slots = np.array([0, 4 * 8])
+    with pytest.raises(ValueError, match="out of range"):
+        mgr.store_batch(data, slots)
+
+
+def test_manager_logical_gt_physical_no_overwrite():
+    # Simulate the C4 geometry: physical block_size=4 (attention slot
+    # granularity) but logical_block_size=16. Tokens 0..15 map into one
+    # logical block; each must get a unique slot.
+    lbs = 16
+    slots = np.array([3 * lbs + off for off in range(lbs)])
+    assert len(set(slots.tolist())) == lbs, "slots must be unique per token"
+
+
+# ---------------------------------------------------------------------------
+# Worker-side canonical mapping helper tests (CPU-runnable).
+# ---------------------------------------------------------------------------
+
+
+class _StubRunner:
+    """Minimal harness exposing GPUModelRunner._build_routed_experts_routing_slots."""
+
+    _build = GPUModelRunner._build_routed_experts_routing_slots
+
+    def build(self, *args, **kwargs):
+        return self._build(*args, **kwargs)
+
+
+def _worker_helper_slots(
+    block_table: list[list[int]],
+    req_indices: list[int],
+    positions: list[int],
+    num_tokens: int,
+    logical_block_size: int,
+) -> list[int]:
+    runner = _StubRunner()
+    out = runner.build(
+        block_table=torch.tensor(block_table, dtype=torch.int32),
+        req_indices=torch.tensor(req_indices, dtype=torch.int64),
+        positions=torch.tensor(positions, dtype=torch.int64),
+        num_tokens=num_tokens,
+        logical_block_size=logical_block_size,
+    )
+    assert out.dtype == torch.int64
+    return out.tolist()
+
+
+def test_worker_helper_full_attention_matches_slot_mapping_semantics():
+    # FullAttention: logical_block_size == block_size (2). The canonical
+    # formula equals the legacy block_table.slot_mapping semantics.
+    block_table = [[5, 6]]
+    got = _worker_helper_slots(
+        block_table,
+        req_indices=[0] * 4,
+        positions=[0, 1, 2, 3],
+        num_tokens=4,
+        logical_block_size=2,
+    )
+    assert got == [5 * 2 + 0, 5 * 2 + 1, 6 * 2 + 0, 6 * 2 + 1]
+
+
+def test_worker_helper_chunked_prefill_second_chunk():
+    # Chunked prefill: positions resume mid logical block.
+    got = _worker_helper_slots(
+        block_table=[[5, 6]],
+        req_indices=[0] * 3,
+        positions=[3, 4, 5],
+        num_tokens=3,
+        logical_block_size=4,
+    )
+    assert got == [5 * 4 + 3, 6 * 4 + 0, 6 * 4 + 1]
+
+
+def test_worker_helper_multi_request_distinct_positions():
+    # Two requests, decode tokens at different logical-block boundaries.
+    got = _worker_helper_slots(
+        block_table=[[5, 6, 0], [9, 10, 11]],
+        req_indices=[0, 0, 1, 1],
+        positions=[7, 8, 15, 16],
+        num_tokens=4,
+        logical_block_size=8,
+    )
+    # req0 row [5, 6, 0]: pos7 -> block5 off7; pos8 -> block6 off0.
+    assert got[0] == 5 * 8 + 7
+    assert got[1] == 6 * 8 + 0
+    # req1 row [9, 10, 11]: pos15 -> block10 off7; pos16 -> block11 off0.
+    assert got[2] == 10 * 8 + 7
+    assert got[3] == 11 * 8 + 0
+
+
+def test_worker_helper_position_beyond_block_table_fails():
+    # Position 128 with logical_block_size=8 needs block table column 16.
+    with pytest.raises(ValueError, match="block table column"):
+        _worker_helper_slots(
+            block_table=[[5, 6], [9, 10]],
+            req_indices=[0, 1],
+            positions=[0, 128],
+            num_tokens=2,
+            logical_block_size=8,
+        )
+
+
+def test_worker_helper_decode_around_logical_block_boundary():
+    # C128 boundary: positions 127/128/129 land in different logical blocks.
+    got = _worker_helper_slots(
+        block_table=[[7, 8, 9]],
+        req_indices=[0] * 3,
+        positions=[127, 128, 129],
+        num_tokens=3,
+        logical_block_size=128,
+    )
+    assert got == [7 * 128 + 127, 8 * 128 + 0, 8 * 128 + 1]
+
+
+def test_worker_helper_padding_rows_stay_minus_one():
+    got = _worker_helper_slots(
+        block_table=[[5]],
+        req_indices=[0, 0, 0, 0],
+        positions=[0, 1, 0, 0],
+        num_tokens=2,
+        logical_block_size=2,
+    )
+    assert got[:2] == [5 * 2, 5 * 2 + 1]
+    assert got[2:] == [-1, -1]
+
+
+def test_worker_helper_compressed_geometry_c4():
+    # C4: logical block covers 4 original tokens even though the physical
+    # KV tensor stores one compressed entry per 4 tokens.
+    got = _worker_helper_slots(
+        block_table=[[2, 3]],
+        req_indices=[0] * 8,
+        positions=list(range(8)),
+        num_tokens=8,
+        logical_block_size=4,
+    )
+    assert got == [2 * 4 + o for o in range(4)] + [3 * 4 + o for o in range(4)]

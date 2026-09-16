@@ -1269,7 +1269,7 @@ class Scheduler(SchedulerInterface):
         # scheduling may call _update_after_schedule again before the
         # prior update_from_output runs).
         if self.enable_return_routed_experts:
-            gid = self.routed_experts_mgr.attn_gid
+            gid = self.routed_experts_mgr.kv_cache_group_id
             self._re_block_ids.update(
                 {
                     rid: self.kv_cache_manager.get_blocks(rid).get_block_ids()[gid]

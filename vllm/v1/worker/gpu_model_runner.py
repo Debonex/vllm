@@ -61,6 +61,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    resolve_routed_experts_slot_mapping_spec,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -2322,16 +2323,26 @@ class GPUModelRunner(
         slot_mapping_gid_0 = slot_mappings[0]
 
         if self.routed_experts_initialized:
-            # Copy this step's attention slot_mapping into our private
-            # device buffer. The shared ``slot_mappings[attn_gid]`` is
-            # owned by the attention block table and will be overwritten
-            # by the next ``_prepare_inputs``; we need a stable snapshot
-            # because the async D2H may still be in flight on the copy
-            # stream when the next step runs.
-            attn_gid = self.routed_experts_attn_gid
-            slot_mapping_attn = slot_mappings[attn_gid]
-            self.routed_experts_slot_mapping_device[:num_tokens].copy_(
-                slot_mapping_attn[:num_tokens]
+            # Compute this step's canonical routing slots into our private
+            # device buffer. The mapping is derived from the routing-anchor
+            # group's block table and the original token positions; it never
+            # reads an attention-backend ``slot_mapping`` (whose token/slot
+            # granularity may differ, e.g. compressed MLA caches). Padding
+            # rows beyond ``num_tokens`` stay ``-1`` and are dropped by
+            # ``store_batch``'s range check on the scheduler side.
+            routing_gid = self.routed_experts_kv_cache_gid
+            routing_block_table = self.input_batch.block_table[
+                routing_gid
+            ].get_device_tensor(num_reqs_padded)
+            routing_slots = self._build_routed_experts_routing_slots(
+                block_table=routing_block_table,
+                req_indices=self.req_indices.gpu[:num_tokens_padded],
+                positions=self.positions[:num_tokens_padded],
+                num_tokens=num_tokens,
+                logical_block_size=self.routed_experts_logical_block_size,
+            )
+            self.routed_experts_slot_mapping_device[: routing_slots.shape[0]].copy_(
+                routing_slots
             )
 
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
@@ -7618,19 +7629,63 @@ class GPUModelRunner(
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
-    def _get_attention_kv_cache_gid(self) -> int:
-        """Find the KV cache group index for attention layers.
+    def _build_routed_experts_routing_slots(
+        self,
+        block_table: torch.Tensor,
+        req_indices: torch.Tensor,
+        positions: torch.Tensor,
+        num_tokens: int,
+        logical_block_size: int,
+    ) -> torch.Tensor:
+        """Compute canonical routed-experts routing slots.
 
-        Must match :attr:`RoutedExpertsManager.attn_gid` in the scheduler:
-        both pick the first ``FullAttentionSpec`` group so hybrid models
-        (Mamba / linear-attention layers that use other AttentionSpec
-        subclasses) end up indexing the same slot layout on both sides.
-        Falls back to 0 only for legacy single-group configs.
+        Implements the fixed canonical mapping
+        ``routing_slot = physical_block_id * logical_block_size
+        + original_position % logical_block_size`` where
+        ``physical_block_id`` comes from the routing-anchor group's
+        block table at row ``req_index`` and column
+        ``original_position // logical_block_size``. Attention-backend
+        ``slot_mapping`` tensors are never read.
+
+        Args:
+            block_table: Routing-anchor group block table,
+                shape (num_reqs, max_num_blocks_per_req).
+            req_indices: Per-token request index, shape (num_tokens,).
+            positions: Per-token original (uncompressed) positions,
+                shape (num_tokens,).
+            num_tokens: Number of valid tokens; entries at
+                ``[num_tokens, ...)`` are set to ``-1``.
+            logical_block_size: Original tokens per block table entry.
+
+        Returns:
+            ``torch.int64`` routing slots of length ``req_indices.shape[0]``
+            with ``-1`` for padding rows.
         """
-        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            if isinstance(group.kv_cache_spec, FullAttentionSpec):
-                return gid
-        return 0
+        total = req_indices.shape[0]
+        routing_slots = torch.full(
+            (total,), -1, dtype=torch.int64, device=block_table.device
+        )
+        if num_tokens == 0:
+            return routing_slots
+        logical_block_indices = positions[:num_tokens] // logical_block_size
+        block_offsets = positions[:num_tokens] % logical_block_size
+        # Guard against out-of-range block table columns (fail fast on
+        # geometry mismatch instead of writing wrong slots).
+        max_block_idx = int(logical_block_indices.max().item())
+        if max_block_idx >= block_table.shape[1]:
+            raise ValueError(
+                "routed experts routing slot mapping: original position "
+                f"requires block table column {max_block_idx} but the "
+                f"routing-anchor block table only has "
+                f"{block_table.shape[1]} columns."
+            )
+        physical_block_ids = block_table[
+            req_indices[:num_tokens].to(torch.int64), logical_block_indices
+        ].to(torch.int64)
+        routing_slots[:num_tokens] = (
+            physical_block_ids * logical_block_size + block_offsets
+        )
+        return routing_slots
 
     def init_routed_experts_capturer(self):
         logger.info(
@@ -7641,7 +7696,9 @@ class GPUModelRunner(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             vllm_config=self.vllm_config,
         )
-        self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
+        slot_spec = resolve_routed_experts_slot_mapping_spec(self.kv_cache_config)
+        self.routed_experts_kv_cache_gid = slot_spec.kv_cache_group_id
+        self.routed_experts_logical_block_size = slot_spec.logical_block_size
         self._bind_routed_experts_capturer(self.routed_experts_capturer)
 
         # Pinned CPU buffer for non-blocking D2H of ``routing_data`` on
@@ -7653,8 +7710,8 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
-        # ``slot_mapping`` dtype is fixed to int64 by
-        # ``block_table.slot_mapping``; we mirror that here.
+        # Routing slots use int64; the same dtype is mirrored on the
+        # device buffer below.
         max_tokens = self.scheduler_config.max_num_batched_tokens
         self.routed_experts_slot_mapping_cpu = torch.empty(
             (max_tokens,),
@@ -7662,13 +7719,14 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
-        # Private device buffer so the shared ``block_table.slot_mapping``
-        # can be overwritten by the next ``_prepare_inputs`` while the
-        # D2H is still pending on the copy stream. Written in
-        # ``_prepare_inputs``, read in ``_bookkeeping_sync`` (sync path)
-        # or cloned into a snapshot (async path).
-        self.routed_experts_slot_mapping_device = torch.empty(
+        # Private device buffer holding canonical routing slots. Written in
+        # ``_build_attention_metadata`` (before the forward), read in
+        # ``_bookkeeping_sync`` (sync path) or cloned into a snapshot
+        # (async path). Padding rows are ``-1`` and filtered by the
+        # scheduler's range check before the buffer write.
+        self.routed_experts_slot_mapping_device = torch.full(
             (max_tokens,),
+            -1,
             dtype=torch.int64,
             device=self.device,
         )

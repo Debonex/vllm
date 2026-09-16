@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -14,9 +15,77 @@ from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RoutedExpertsSlotMappingSpec:
+    """Resolved routing-anchor geometry for routed-experts capture.
+
+    Shared by the scheduler (``RoutedExpertsManager``) and the worker
+    (model runner) so both sides index the same slot layout.
+    """
+
+    kv_cache_group_id: int
+    logical_block_size: int
+
+
+def _get_routed_experts_logical_block_size(group: KVCacheGroupSpec) -> int | None:
+    """Resolve the logical block size of a group, unpacking uniform specs."""
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        sizes = {
+            sub_spec.routed_experts_logical_block_size
+            for sub_spec in spec.kv_cache_specs.values()
+        }
+        if len(sizes) != 1:
+            return None
+        return sizes.pop()
+    return spec.routed_experts_logical_block_size
+
+
+def resolve_routed_experts_slot_mapping_spec(
+    kv_cache_config: KVCacheConfig,
+) -> RoutedExpertsSlotMappingSpec:
+    """Pick the KV cache group that anchors routed-experts slot mapping.
+
+    Selection rule (fixed, shared by scheduler and worker):
+    among groups whose spec reports a positive ``routed_experts_logical_block_size``,
+    choose the smallest logical block size; break ties by the smallest group id.
+    Fail fast when no valid candidate exists.
+    """
+    candidates: list[tuple[int, int]] = []
+    for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+        size = _get_routed_experts_logical_block_size(group)
+        if size is None:
+            continue
+        if not isinstance(size, int) or size <= 0:
+            raise ValueError(
+                "RoutedExpertsManager: kv cache group "
+                f"{gid} reported invalid routed_experts_logical_block_size "
+                f"{size!r}; expected a positive integer or None."
+            )
+        candidates.append((size, gid))
+
+    if not candidates:
+        raise ValueError(
+            "RoutedExpertsManager: no KV cache group can serve as a stable "
+            "routing anchor for routed experts (all groups report "
+            "routed_experts_logical_block_size=None)."
+        )
+
+    logical_block_size, kv_cache_group_id = min(candidates)
+    return RoutedExpertsSlotMappingSpec(
+        kv_cache_group_id=kv_cache_group_id,
+        logical_block_size=logical_block_size,
+    )
 
 
 def _get_num_experts_per_tok(hf_config) -> int:
@@ -250,19 +319,14 @@ class RoutedExpertsManager:
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        # Pick the attention group for block/slot mapping. We require
-        # a FullAttentionSpec group rather than any AttentionSpec to
-        # stay consistent with the worker-side lookup in
-        # ``GPUModelRunner._get_attention_kv_cache_gid``; hybrid models
-        # (Mamba / linear attention) also have other AttentionSpec
-        # groups whose slot layout differs.
-        self.attn_gid = next(
-            gid
-            for gid, g in enumerate(kv_cache_config.kv_cache_groups)
-            if isinstance(g.kv_cache_spec, FullAttentionSpec)
-        )
-        attn_group = kv_cache_config.kv_cache_groups[self.attn_gid]
-        self.block_size = attn_group.kv_cache_spec.block_size
+        # Resolve the routing-anchor group via the shared resolver so the
+        # scheduler and the worker always agree on the slot layout. The
+        # anchor is expressed purely by spec geometry
+        # (``routed_experts_logical_block_size``), never by group order,
+        # attention-backend slot mappings, or model identity.
+        slot_spec = resolve_routed_experts_slot_mapping_spec(kv_cache_config)
+        self.kv_cache_group_id = slot_spec.kv_cache_group_id
+        self.logical_block_size = slot_spec.logical_block_size
 
         # All kv_cache_groups share the same physical block pool, so
         # block IDs span [0, num_blocks) regardless of how many groups
@@ -271,7 +335,7 @@ class RoutedExpertsManager:
         hf_config = vllm_config.model_config.hf_text_config
         num_experts = get_num_experts(hf_config)
         num_experts_per_tok = _get_num_experts_per_tok(hf_config)
-        max_num_slots = kv_cache_config.num_blocks * self.block_size
+        max_num_slots = kv_cache_config.num_blocks * self.logical_block_size
         # Expert IDs are 0..num_experts-1; uint8 fits 256 distinct
         # values so the boundary is ``<= 256`` (NOT ``< 256``). Keeping
         # this narrow matters because the slot buffer is sized for the
@@ -301,7 +365,26 @@ class RoutedExpertsManager:
         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
         indexing handles repeated / out-of-order indices. Called once
         per scheduler step in ``update_from_output``.
+
+        Raises:
+            ValueError: If data rows and slot count disagree, or any slot
+                is negative / beyond the buffer capacity.
         """
+        if data.shape[0] != slot_mapping.shape[0]:
+            raise ValueError(
+                "RoutedExpertsManager.store_batch: data rows "
+                f"({data.shape[0]}) do not match slot_mapping entries "
+                f"({slot_mapping.shape[0]})."
+            )
+        max_num_slots = self.routed_experts_by_slot.shape[0]
+        if slot_mapping.size and (
+            int(slot_mapping.min()) < 0 or int(slot_mapping.max()) >= max_num_slots
+        ):
+            raise ValueError(
+                "RoutedExpertsManager.store_batch: slot_mapping out of range "
+                f"[0, {max_num_slots}); got min={int(slot_mapping.min())}, "
+                f"max={int(slot_mapping.max())}."
+            )
         self.routed_experts_by_slot[slot_mapping] = data
 
     def get(
@@ -319,7 +402,7 @@ class RoutedExpertsManager:
         replace the fancy index with a slice without re-verifying.
 
         Args:
-            block_ids: Block IDs from the attention KV-cache group.
+            block_ids: Block IDs from the routing-anchor KV-cache group.
             num_tokens: Number of tokens that have gone through a forward
                 pass and therefore have routing data written to their
                 slots (typically ``request.num_tokens - 1``; the last
@@ -335,15 +418,26 @@ class RoutedExpertsManager:
             Array of shape (num_tokens - token_start, num_layers,
             num_experts_per_tok).
         """
-        bs = self.block_size
-        block_ids_array = np.array(block_ids, dtype=np.int32)
-        block_offsets = np.arange(bs)
-        # slot = block_id * block_size + offset_in_block; flatten the
-        # (num_blocks, block_size) grid and trim to num_tokens, then
-        # skip the first token_start entries so only the requested
-        # range is fetched in a single fancy-index read.
+        lbs = self.logical_block_size
+        num_required_logical_blocks = cdiv(num_tokens, lbs)
+        if num_required_logical_blocks > len(block_ids):
+            raise ValueError(
+                "RoutedExpertsManager.get: request needs "
+                f"{num_required_logical_blocks} logical blocks for "
+                f"{num_tokens} tokens (logical_block_size={lbs}) but only "
+                f"{len(block_ids)} block IDs were snapshotted."
+            )
+        block_ids_array = np.array(block_ids, dtype=np.int64)
+        block_offsets = np.arange(lbs)
+        # Canonical routing slot:
+        #   logical_block_index = original_position // logical_block_size
+        #   block_offset        = original_position % logical_block_size
+        #   routing_slot = physical_block_id * logical_block_size + block_offset
+        # Flatten the (num_blocks, logical_block_size) grid, trim to
+        # num_tokens, then skip the first token_start entries so only the
+        # requested range is fetched in a single fancy-index read.
         slot_mapping = (
-            block_ids_array.reshape(-1, 1) * bs + block_offsets.reshape(1, -1)
+            block_ids_array.reshape(-1, 1) * lbs + block_offsets.reshape(1, -1)
         ).flatten()[:num_tokens]
         slot_mapping = slot_mapping[token_start:]
         return self.routed_experts_by_slot[slot_mapping]

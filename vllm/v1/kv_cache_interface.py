@@ -146,6 +146,17 @@ class KVCacheSpec:
         """
         return replace(self, block_size=block_size)
 
+    @property
+    def routed_experts_logical_block_size(self) -> int | None:
+        """Number of original tokens covered by one block table entry.
+
+        ``None`` means this spec cannot serve as a stable routing anchor for
+        routed-experts capture (e.g. specs that recycle historical blocks).
+        Only the routing address geometry is described here; buffer
+        allocation and model identity checks are out of scope.
+        """
+        return None
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         """
@@ -250,6 +261,11 @@ class FullAttentionSpec(AttentionSpec):
     caching) regardless of tensor-parallel layout. It does not affect the KV
     cache layout itself.
     """
+
+    @property
+    def routed_experts_logical_block_size(self) -> int | None:
+        """One block table entry stores ``block_size`` original tokens."""
+        return self.block_size
 
     def __post_init__(self):
         if self.head_size_v is None:
